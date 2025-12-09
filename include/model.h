@@ -13,12 +13,17 @@ extern std::unique_ptr<ModelLoader> g_model_loader;
 
 class LFM2Model {
 public:
-    LFM2Model(const std::string& model_file);
+    LFM2Model(const std::string& model_file, int start_layer, int end_layer, int device_id);
     
     // Forward pass
     void forward(const std::vector<int>& input_ids, Tensor& logits);
     
 private:
+
+    int start_layer_;
+    int end_layer_;
+    int device_id_;
+    
     std::unique_ptr<ModelLoader> loader_;
     
     // Embeddings

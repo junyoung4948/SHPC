@@ -65,6 +65,15 @@ Tensor ModelLoader::load_tensor(const std::string& name) {
     
     // Create tensor with shape
     Tensor tensor(info.shape);
+
+    // [추가] 힙 오염 방지용 크기 검증
+    size_t expected_bytes = tensor.size() * sizeof(float);
+    if (info.size > expected_bytes) {
+        std::cerr << "[Fatal Error] Heap Overflow detected for " << name << "!" << std::endl;
+        std::cerr << "  - File info size: " << info.size << " bytes" << std::endl;
+        std::cerr << "  - Allocated size: " << expected_bytes << " bytes" << std::endl;
+        throw std::runtime_error("Heap corruption prevention: Buffer overflow detected.");
+    }
     
     // Open file and seek to tensor data
     std::ifstream file(model_file_, std::ios::binary);

@@ -4,6 +4,7 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <cuda_runtime.h>
 
 /* Macro for checking CUDA errors */
 #define CHECK_CUDA(call)                                                 \
@@ -68,7 +69,8 @@ public:
     void save_to_file(const std::string& filename) const;
     
     // Tensor operations
-    Tensor transpose(int dim0, int dim1) const;
+    // Tensor transpose(int dim0, int dim1) const;
+    void transpose();
     Tensor slice(int dim, size_t start, size_t end) const;
     Tensor copy() const;
     
@@ -77,11 +79,25 @@ public:
     void zero();
     void ones();
 
+    // [추가됨] GPU 관련 메서드
+    void to_device();   // CPU -> GPU 메모리 할당 및 복사
+    void to_host();     // GPU -> CPU 데이터 복사
+    void free_device(); // GPU 메모리 해제
+    void free_host();
+    
+    // [추가됨] GPU 데이터 접근자
+    float* device_data() { return d_data_; }
+    const float* device_data() const { return d_data_; }
+    float* host_data() {return data_;}
+
 private:
     std::vector<size_t> shape_;
     size_t size_;
     float* data_;
     bool owns_data_;
+
+    // [추가됨] GPU Memory Pointer
+    float* d_data_ = nullptr;
     
     void allocate();
     void deallocate();

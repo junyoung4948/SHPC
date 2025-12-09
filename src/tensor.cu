@@ -14,16 +14,16 @@ extern std::unique_ptr<ModelLoader> g_model_loader;
 // All tensor operations are implemented in layer.cu
 
 // Tensor constructors and destructors
-Tensor::Tensor() : size_(0), data_(nullptr), owns_data_(false) {}
+Tensor::Tensor() : size_(0), data_(nullptr), owns_data_(false), d_data_(nullptr) {}
 
 Tensor::Tensor(const std::vector<size_t>& shape) 
-    : shape_(shape), owns_data_(true) {
+    : shape_(shape), owns_data_(true), d_data_(nullptr) {
     size_ = compute_size();
     allocate();
 }
 
 Tensor::Tensor(const std::vector<size_t>& shape, float* data, bool copy)
-    : shape_(shape), owns_data_(copy) {
+    : shape_(shape), owns_data_(copy), d_data_(nullptr) {
     size_ = compute_size();
     if (copy) {
         allocate();
@@ -35,11 +35,102 @@ Tensor::Tensor(const std::vector<size_t>& shape, float* data, bool copy)
 
 Tensor::~Tensor() {
     deallocate();
+    free_device();
 }
 
-// Copy constructor
+// [추가됨] GPU 메모리 할당 및 데이터 복사 (CPU -> GPU)
+void Tensor::to_device() {
+    if (size_ == 0) return;
+    
+    // 이미 할당되지 않은 경우에만 할당
+    if (d_data_ == nullptr) {
+        CHECK_CUDA(cudaMalloc((void**)&d_data_, size_ * sizeof(float)));
+    }
+    
+    // 데이터가 CPU에 있다면 복사
+    if (data_ != nullptr) {
+        CHECK_CUDA(cudaMemcpy(d_data_, data_, size_ * sizeof(float), cudaMemcpyHostToDevice));
+    }
+}
+
+// [추가됨] 데이터 복사 (GPU -> CPU)
+void Tensor::to_host() {
+    if (d_data_ == nullptr || data_ == nullptr || size_ == 0) return;
+    CHECK_CUDA(cudaMemcpy(data_, d_data_, size_ * sizeof(float), cudaMemcpyDeviceToHost));
+}
+
+// CPU 메모리 해제 (핵심: GPU로 보낸 후 호출)
+void Tensor::free_host() {
+    if (owns_data_ && data_ != nullptr) {
+        delete[] data_; 
+        data_ = nullptr;
+        owns_data_ = false;
+    }
+}
+
+// [추가됨] GPU 메모리 해제
+void Tensor::free_device() {
+    if (d_data_ != nullptr) {
+        CHECK_CUDA(cudaFree(d_data_));
+        d_data_ = nullptr;
+    }
+}
+
+// [추가] Transpose (CPU Only, 2D)
+void Tensor::transpose() {
+
+    // 1. 데이터가 없거나 차원이 안 맞으면 중단
+    if (data_ == nullptr || shape_.size() != 2) {
+        std::cerr << "Error: Invalid transpose target. data=" << data_ 
+                  << ", ndim=" << shape_.size() << std::endl;
+        return;
+    }
+    
+    // 1. 차원 체크
+    if (shape_.size() != 2) {
+        std::cerr << "Error: Tensor::transpose only supports 2D tensors." << std::endl;
+        return;
+    }
+    
+    // 2. 경고: 이미 GPU에 데이터가 올라가 있다면 싱크가 안 맞을 수 있음
+    if (d_data_ != nullptr) {
+        std::cerr << "Warning: Transpose called after to_device(). GPU data will not reflect changes unless to_device() is called again." << std::endl;
+    }
+
+    size_t rows = shape_[0];
+    size_t cols = shape_[1];
+
+    // 2. 사이즈 검증 (혹시 shape과 size가 불일치하는지)
+    if (size_ != rows * cols) {
+        std::cerr << "Error: Size mismatch in transpose. size=" << size_ 
+                  << ", expected=" << rows * cols << std::endl;
+        return;
+   }
+
+    // 3. 임시 버퍼 생성 
+    std::vector<float> new_data(size_);
+
+    // 4. Transpose 수행 (Cache miss가 발생하지만 1회성이므로 허용)
+    // data_가 [rows][cols]라고 가정하고 new_data를 [cols][rows]로 채움
+    #pragma omp parallel for collapse(2) // OpenMP가 있다면 성능 향상 가능 (없어도 무방)
+    for (size_t r = 0; r < rows; ++r) {
+        for (size_t c = 0; c < cols; ++c) {
+            // new_data[c, r] = old_data[r, c]
+            new_data[c * rows + r] = data_[r * cols + c];
+        }
+    }
+
+    // 5. 데이터 덮어쓰기
+    std::memcpy(data_, new_data.data(), size_ * sizeof(float));
+
+    // 6. Shape 변경
+    shape_[0] = cols;
+    shape_[1] = rows;
+}
+
+// Copy constructor only cpu
 Tensor::Tensor(const Tensor& other)
-    : shape_(other.shape_), size_(other.size_), owns_data_(true) {
+    : shape_(other.shape_), size_(other.size_), owns_data_(true), d_data_(nullptr) {
     if (other.size_ > 0) {
         allocate();
         std::memcpy(data_, other.data_, size_ * sizeof(float));
@@ -64,24 +155,28 @@ Tensor& Tensor::operator=(const Tensor& other) {
 // Move constructor
 Tensor::Tensor(Tensor&& other) noexcept
     : shape_(std::move(other.shape_)), size_(other.size_),
-      data_(other.data_), owns_data_(other.owns_data_) {
+      data_(other.data_), owns_data_(other.owns_data_), d_data_(other.d_data_){
     other.data_ = nullptr;
     other.size_ = 0;
     other.owns_data_ = false;
+    other.d_data_ = nullptr;
 }
 
 // Move assignment
 Tensor& Tensor::operator=(Tensor&& other) noexcept {
     if (this != &other) {
         deallocate();
+        free_device();
         shape_ = std::move(other.shape_);
         size_ = other.size_;
         data_ = other.data_;
         owns_data_ = other.owns_data_;
+        d_data_ = other.d_data_;
         
         other.data_ = nullptr;
         other.size_ = 0;
         other.owns_data_ = false;
+        other.d_data_ = nullptr;
     }
     return *this;
 }

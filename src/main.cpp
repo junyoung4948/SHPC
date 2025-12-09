@@ -15,6 +15,10 @@ static int num_samples = 1;
 static bool run_validation = false;
 static bool run_warmup = false;
 
+// 전역 변수로 두 개의 모델 샤드 관리 (PP=2)
+std::unique_ptr<LFM2Model> g_shard0; // GPU 0: Layers 0-11
+std::unique_ptr<LFM2Model> g_shard1; // GPU 1: Layers 12-23
+
 double get_time() {
   struct timespec tv;
   clock_gettime(CLOCK_MONOTONIC, &tv);
@@ -160,57 +164,88 @@ int main(int argc, char* argv[]) {
     }
 
     // Load model
-    if (mpi_rank == 0) fprintf(stdout, "Loading model from %s...", model_file.c_str());
-    LFM2Model model(model_file);
+    // if (mpi_rank == 0) 
+    // LFM2Model model(model_file);
+    /* -------------------------------------------------------------------------
+     * Step 1: Multi-GPU Partial Loading
+     * ------------------------------------------------------------------------- */
+    if (mpi_rank == 0) {
+        fprintf(stdout, "Loading model from %s...", model_file.c_str());
 
-    /* Warm-up */
-    if (run_warmup && mpi_rank == 0) {
-        fprintf(stdout, "Warming up...");
-        std::vector<int> warmup_input(inputs, inputs + seq_length);
-        Tensor warmup_logits;
-        for (int i = 0; i < 3; i++) {
-            model.forward(warmup_input, warmup_logits);
-        }
-        fprintf(stdout, "Done!\n\n");
+        // --- GPU 0: Part A 로드 ---
+        // start=0, end=12 (Embedding 포함, 0~11 Layer)
+        std::cout << "\n[Main] Loading Shard 0 on GPU 0..." << std::endl;
+        g_shard0 = std::make_unique<LFM2Model>(model_file, 0, 12, 0);
+
+        // --- GPU 1: Part B 로드 ---
+        // start=12, end=24 (12~23 Layer + Output)
+        std::cout << "\n[Main] Loading Shard 1 on GPU 1..." << std::endl;
+        g_shard1 = std::make_unique<LFM2Model>(model_file, 12, 24, 1);
+        
+        std::cout << "\n[Main] All shards loaded successfully!" << std::endl;
+        
+        // 메모리 점검 출력
+        size_t free, total;
+        
+        cudaSetDevice(0);
+        cudaMemGetInfo(&free, &total);
+        std::cout << "[GPU 0] Free Memory: " << free / (1024.0*1024.0*1024.0) << " GB / " 
+                  << total / (1024.0*1024.0*1024.0) << " GB" << std::endl;
+        
+        cudaSetDevice(1);
+        cudaMemGetInfo(&free, &total);
+        std::cout << "[GPU 1] Free Memory: " << free / (1024.0*1024.0*1024.0) << " GB / " 
+                  << total / (1024.0*1024.0*1024.0) << " GB" << std::endl;
     }
 
-    ////////////////////////////////////////////////////////////////////
-    // MODEL COMPUTATION                                              //
-    ////////////////////////////////////////////////////////////////////
+    // /* Warm-up */
+    // if (run_warmup && mpi_rank == 0) {
+    //     fprintf(stdout, "Warming up...");
+    //     std::vector<int> warmup_input(inputs, inputs + seq_length);
+    //     Tensor warmup_logits;
+    //     for (int i = 0; i < 3; i++) {
+    //         model.forward(warmup_input, warmup_logits);
+    //     }
+    //     fprintf(stdout, "Done!\n\n");
+    // }
+
+    // ////////////////////////////////////////////////////////////////////
+    // // MODEL COMPUTATION                                              //
+    // ////////////////////////////////////////////////////////////////////
 
     double st = 0.0, et = 0.0;
 
-    if (mpi_rank == 0) {
-        fprintf(stdout, "Generating...");
-        fflush(stdout);
-    }
+    // if (mpi_rank == 0) {
+    //     fprintf(stdout, "Generating...");
+    //     fflush(stdout);
+    // }
 
-    for (size_t i = 0; i < 4; i++) {
-        CHECK_CUDA(cudaSetDevice(i));
-        CHECK_CUDA(cudaDeviceSynchronize());
-    }
-    CHECK_CUDA(cudaSetDevice(0));
-    MPI_Barrier(MPI_COMM_WORLD);
+    // for (size_t i = 0; i < 4; i++) {
+    //     CHECK_CUDA(cudaSetDevice(i));
+    //     CHECK_CUDA(cudaDeviceSynchronize());
+    // }
+    // CHECK_CUDA(cudaSetDevice(0));
+    // MPI_Barrier(MPI_COMM_WORLD);
 
-    if (mpi_rank == 0) st = get_time();
+    // if (mpi_rank == 0) st = get_time();
 
-    /* Call the main computation */
-    if (mpi_rank == 0) {
-        for (int sample_idx = 0; sample_idx < num_samples; sample_idx++) {
-            // Get input for this sample
-            std::vector<int> input_ids_vec(inputs + sample_idx * seq_length, 
-                                          inputs + (sample_idx + 1) * seq_length);
+    // /* Call the main computation */
+    // if (mpi_rank == 0) {
+    //     for (int sample_idx = 0; sample_idx < num_samples; sample_idx++) {
+    //         // Get input for this sample
+    //         std::vector<int> input_ids_vec(inputs + sample_idx * seq_length, 
+    //                                       inputs + (sample_idx + 1) * seq_length);
             
-            // Run forward pass
-            Tensor logits;
-            model.forward(input_ids_vec, logits);
+    //         // Run forward pass
+    //         Tensor logits;
+    //         model.forward(input_ids_vec, logits);
             
-            // Copy logits to output buffer
-            for (size_t i = 0; i < VOCAB_SIZE; i++) {
-                outputs[sample_idx * VOCAB_SIZE + i] = logits.at(0, i);
-            }
-        }
-    }
+    //         // Copy logits to output buffer
+    //         for (size_t i = 0; i < VOCAB_SIZE; i++) {
+    //             outputs[sample_idx * VOCAB_SIZE + i] = logits.at(0, i);
+    //         }
+    //     }
+    // }
 
     for (size_t i = 0; i < 4; i++) {
         CHECK_CUDA(cudaSetDevice(i));

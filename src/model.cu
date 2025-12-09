@@ -11,14 +11,31 @@
 std::unique_ptr<ModelLoader> g_model_loader;
 
 // ============================================================================
+// Helper Function 
+// ============================================================================
+static void load_weight_optimized(Tensor& tensor, const std::string& path, bool do_transpose) {
+    tensor = Tensor::load_from_file(path);
+    if (do_transpose) {
+        tensor.transpose(); // Linear Layer인 경우 A x B^T -> A x B로 변환
+    }
+    tensor.to_device();     // GPU 메모리 할당 및 복사
+    tensor.free_host();     // CPU 메모리 해제
+}
+
+// ============================================================================
 // Large Block Implementations - Complex layers and modules
 // ============================================================================
 
 // MLP (Feed-Forward Network) implementation
 MLP::MLP(const std::string& w1_file, const std::string& w2_file, const std::string& w3_file) {
-    w1_ = Tensor::load_from_file(w1_file);
-    w2_ = Tensor::load_from_file(w2_file);
-    w3_ = Tensor::load_from_file(w3_file);
+    // MLP의 w1, w2, w3는 모두 Linear Layer이므로 Transpose 필요
+    std::cout << "MLP loading" << std::endl;
+    
+    load_weight_optimized(w1_, w1_file, true);
+    load_weight_optimized(w2_, w2_file, true);
+    load_weight_optimized(w3_, w3_file, true);
+
+    std::cout << "MLP loaded" << std::endl;
 }
 
 void MLP::forward(const Tensor& x, Tensor& y) {
@@ -68,7 +85,7 @@ SparseMoeBlock::SparseMoeBlock(int layer_idx) {
     // Load gate weights (router)
     std::stringstream ss;
     ss << "layers." << layer_idx << ".feed_forward.gate.weight";
-    gate_ = Tensor::load_from_file(ss.str());
+    load_weight_optimized(gate_, ss.str(), true);
     
     // Load expert weights
     experts_.reserve(NUM_EXPERTS);
@@ -85,7 +102,10 @@ SparseMoeBlock::SparseMoeBlock(int layer_idx) {
     if (USE_EXPERT_BIAS) {
         std::stringstream ss_bias;
         ss_bias << "layers." << layer_idx << ".feed_forward.expert_bias";
-        expert_bias_ = Tensor::load_from_file(ss_bias.str());
+        // Bias는 transpose 불필요
+        if (g_model_loader->has_tensor(ss_bias.str())) {
+            load_weight_optimized(expert_bias_, ss_bias.str(), false);
+        }
     }
 }
 
@@ -209,10 +229,11 @@ Attention::Attention(int layer_idx) : layer_idx_(layer_idx) {
     ss_q_ln << "layers." << layer_idx << ".self_attn.q_layernorm.weight";
     ss_k_ln << "layers." << layer_idx << ".self_attn.k_layernorm.weight";
     
-    q_proj_ = Tensor::load_from_file(ss_q.str());
-    k_proj_ = Tensor::load_from_file(ss_k.str());
-    v_proj_ = Tensor::load_from_file(ss_v.str());
-    o_proj_ = Tensor::load_from_file(ss_o.str());
+    // Projections (Linear Layers) -> Transpose True
+    load_weight_optimized(q_proj_, ss_q.str(), true);
+    load_weight_optimized(k_proj_, ss_k.str(), true);
+    load_weight_optimized(v_proj_, ss_v.str(), true);
+    load_weight_optimized(o_proj_, ss_o.str(), true);
     
     q_layernorm_ = std::make_unique<RMSNorm>(ss_q_ln.str());
     k_layernorm_ = std::make_unique<RMSNorm>(ss_k_ln.str());
@@ -362,14 +383,18 @@ void Attention::forward(const Tensor& x, const Tensor& cos, const Tensor& sin,
 
 // ShortConv implementation
 ShortConv::ShortConv(int layer_idx) : layer_idx_(layer_idx) {
+    std::cout << "conv layer loading" << std::endl;
     std::stringstream ss_conv, ss_in, ss_out;
     ss_conv << "layers." << layer_idx << ".conv.conv.weight";
     ss_in << "layers." << layer_idx << ".conv.in_proj.weight";
     ss_out << "layers." << layer_idx << ".conv.out_proj.weight";
     
-    conv_weight_ = Tensor::load_from_file(ss_conv.str());
-    in_proj_weight_ = Tensor::load_from_file(ss_in.str());
-    out_proj_weight_ = Tensor::load_from_file(ss_out.str());
+    // Conv Weight -> Convolution (No Transpose)
+    load_weight_optimized(conv_weight_, ss_conv.str(), false);
+    
+    // In/Out Proj -> Linear Layers (Transpose True)
+    load_weight_optimized(in_proj_weight_, ss_in.str(), true);
+    load_weight_optimized(out_proj_weight_, ss_out.str(), true);
     
     // Load biases if they exist
     if (USE_CONV_BIAS) {
@@ -377,17 +402,19 @@ ShortConv::ShortConv(int layer_idx) : layer_idx_(layer_idx) {
         ss_conv_bias << "layers." << layer_idx << ".conv.conv.bias";
         ss_in_bias << "layers." << layer_idx << ".conv.in_proj.bias";
         ss_out_bias << "layers." << layer_idx << ".conv.out_proj.bias";
-        
+
+        // bias (No Transpose)
         if (g_model_loader->has_tensor(ss_conv_bias.str())) {
-            conv_bias_ = Tensor::load_from_file(ss_conv_bias.str());
+            load_weight_optimized(conv_bias_, ss_conv_bias.str(), false);
         }
         if (g_model_loader->has_tensor(ss_in_bias.str())) {
-            in_proj_bias_ = Tensor::load_from_file(ss_in_bias.str());
+            load_weight_optimized(in_proj_bias_, ss_in_bias.str(), false);
         }
         if (g_model_loader->has_tensor(ss_out_bias.str())) {
-            out_proj_bias_ = Tensor::load_from_file(ss_out_bias.str());
+            load_weight_optimized(out_proj_bias_, ss_out_bias.str(), false);
         }
     }
+    std::cout << "conv layer loaded" << std::endl;
 }
 
 void ShortConv::forward(const Tensor& x, Tensor& y) {
@@ -488,6 +515,9 @@ void ShortConv::forward(const Tensor& x, Tensor& y) {
 // DecoderLayer implementation
 DecoderLayer::DecoderLayer(int layer_idx, bool is_attention_layer)
     : layer_idx_(layer_idx), is_attention_layer_(is_attention_layer) {
+
+    std::cout << "decoder layer idx: " << layer_idx << std::endl;
+    
     
     // Load normalization layers
     std::stringstream ss_norm1, ss_norm2;
@@ -558,15 +588,30 @@ void DecoderLayer::forward(const Tensor& x, const Tensor& cos, const Tensor& sin
 // LFM2Model Implementation - Complete model
 // ============================================================================
 
-LFM2Model::LFM2Model(const std::string& model_file) {
+LFM2Model::LFM2Model(const std::string& model_file, int start_layer, int end_layer, int device_id)
+    : start_layer_(start_layer), end_layer_(end_layer), device_id_(device_id) {
     std::cout << "Loading LFM2-8B-A1B model from " << model_file << std::endl;
+
+    // 해당 GPU 컨텍스트 설정 
+    CHECK_CUDA(cudaSetDevice(device_id_));
+    std::cout << "[Model] Initializing on Device " << device_id_ 
+              << " (Layers " << start_layer_ << "~" << end_layer_ << ")" << std::endl;
     
-    // Initialize global model loader
-    g_model_loader = std::make_unique<ModelLoader>(model_file);
+    if (!g_model_loader) {
+        g_model_loader = std::make_unique<ModelLoader>(model_file);
+    }
     
-    load_embeddings();
+    // 0번 Rank(혹은 첫 번째 파이프라인)만 임베딩 로드
+    if (start_layer_ == 0) {
+        load_embeddings();
+    }
+
     load_layers();
-    load_output_layers();
+
+    // 마지막 파이프라인 단계만 Output 로드
+    if (end_layer_ >= NUM_HIDDEN_LAYERS) {
+        load_output_layers();
+    }
     
     // Initialize RoPE
     rotary_emb_ = std::make_unique<RotaryEmbedding>();
@@ -578,18 +623,25 @@ void LFM2Model::load_embeddings() {
     std::cout << "Loading embeddings..." << std::endl;
     embed_tokens_ = Tensor::load_from_file("embed_tokens.weight");
     std::cout << "  Embeddings shape: " << embed_tokens_.size(0) << " x " << embed_tokens_.size(1) << std::endl;
+    embed_tokens_.to_device();
+    embed_tokens_.free_host(); // Free CPU
 }
 
 void LFM2Model::load_layers() {
-    std::cout << "Loading " << NUM_HIDDEN_LAYERS << " decoder layers..." << std::endl;
+    // std::cout << "Loading " << NUM_HIDDEN_LAYERS << " decoder layers..." << std::endl;
+    std::cout << "Loading layers from " << start_layer_ << " to " << end_layer_ << std::endl;
     
     // Read layer types from config.h LAYER_TYPES array
     // 0 = full_attention, 1 = conv
     layers_.reserve(NUM_HIDDEN_LAYERS);
     for (size_t i = 0; i < NUM_HIDDEN_LAYERS; i++) {
+        // 내 범위 밖이면 패스 (nullptr로 남음)
+        if (i < start_layer_ || i >= end_layer_) {
+            continue;
+        }
         bool is_attention = (LAYER_TYPES[i] == 0);
         std::cout << "  Layer " << i << ": " << (is_attention ? "Attention" : "Conv") << std::endl;
-        layers_.push_back(std::make_unique<DecoderLayer>(i, is_attention));
+        layers_[i] = (std::make_unique<DecoderLayer>(i, is_attention));
     }
 }
 
@@ -603,9 +655,12 @@ void LFM2Model::load_output_layers() {
         lm_head_ = Tensor::load_from_file("lm_head.weight");
     } else {
         // Use tied weights (same as embeddings)
-        lm_head_ = embed_tokens_;
+        lm_head_ = Tensor::load_from_file("embed_tokens.weight");
         std::cout << "  Using tied weights for LM head" << std::endl;
     }
+    lm_head_.transpose(); 
+    lm_head_.to_device();
+    lm_head_.free_host();
 }
 
 void LFM2Model::forward(const std::vector<int>& input_ids, Tensor& logits) {

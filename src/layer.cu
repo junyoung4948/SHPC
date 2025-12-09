@@ -299,6 +299,12 @@ void causal_conv1d(const Tensor& x, const Tensor& weight, const Tensor* bias, Te
 // RMSNorm implementation
 RMSNorm::RMSNorm(const std::string& weight_file) {
     weight_ = Tensor::load_from_file(weight_file);
+
+    // 2. Move to GPU immediately
+    weight_.to_device();
+    
+    // 3. Free CPU memory to save RAM
+    weight_.free_host();
 }
 
 void RMSNorm::forward(const Tensor& x, Tensor& y) {
@@ -313,6 +319,7 @@ RotaryEmbedding::RotaryEmbedding() : max_seq_len_(MAX_POSITION_EMBEDDINGS) {
                                        cos_cached_, sin_cached_);
 }
 
+// 만약 GPU에서 할 거라면 나머지 layer class들처럼 data들 GPU로 옮기는 작업 필요요
 void RotaryEmbedding::forward(size_t seq_len, Tensor& cos, Tensor& sin) {
     // Return cached values for the given sequence length
     // cos, sin should be: (seq_len, head_dim)
