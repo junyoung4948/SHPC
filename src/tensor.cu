@@ -141,12 +141,18 @@ Tensor::Tensor(const Tensor& other)
 Tensor& Tensor::operator=(const Tensor& other) {
     if (this != &other) {
         deallocate();
+        free_device();
         shape_ = other.shape_;
         size_ = other.size_;
         owns_data_ = true;
+        d_data_ = nullptr;
+        
         if (other.size_ > 0) {
             allocate();
             std::memcpy(data_, other.data_, size_ * sizeof(float));
+        }
+        else{
+            data_ = nullptr;
         }
     }
     return *this;

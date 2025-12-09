@@ -380,6 +380,11 @@ int main(int argc, char* argv[]) {
         CHECK_CUDA(cudaFreeHost(inputs));
         CHECK_CUDA(cudaFreeHost(outputs));
     }
+    if (mpi_rank == 0) {
+        std::cout << "[Main] Cleaning up resources..." << std::endl;
+        g_shard0.reset(); // Shard 0 ¼Ò¸ê (cudaFree È£Ãâ)
+        g_shard1.reset(); // Shard 1 ¼Ò¸ê (cudaFree È£Ãâ)
+    }
 
     /* MPI Finalization */
     MPI_Finalize();

@@ -29,13 +29,10 @@ static void load_weight_optimized(Tensor& tensor, const std::string& path, bool 
 // MLP (Feed-Forward Network) implementation
 MLP::MLP(const std::string& w1_file, const std::string& w2_file, const std::string& w3_file) {
     // MLP의 w1, w2, w3는 모두 Linear Layer이므로 Transpose 필요
-    std::cout << "MLP loading" << std::endl;
     
     load_weight_optimized(w1_, w1_file, true);
     load_weight_optimized(w2_, w2_file, true);
     load_weight_optimized(w3_, w3_file, true);
-
-    std::cout << "MLP loaded" << std::endl;
 }
 
 void MLP::forward(const Tensor& x, Tensor& y) {
@@ -383,7 +380,6 @@ void Attention::forward(const Tensor& x, const Tensor& cos, const Tensor& sin,
 
 // ShortConv implementation
 ShortConv::ShortConv(int layer_idx) : layer_idx_(layer_idx) {
-    std::cout << "conv layer loading" << std::endl;
     std::stringstream ss_conv, ss_in, ss_out;
     ss_conv << "layers." << layer_idx << ".conv.conv.weight";
     ss_in << "layers." << layer_idx << ".conv.in_proj.weight";
@@ -414,7 +410,6 @@ ShortConv::ShortConv(int layer_idx) : layer_idx_(layer_idx) {
             load_weight_optimized(out_proj_bias_, ss_out_bias.str(), false);
         }
     }
-    std::cout << "conv layer loaded" << std::endl;
 }
 
 void ShortConv::forward(const Tensor& x, Tensor& y) {
@@ -516,9 +511,6 @@ void ShortConv::forward(const Tensor& x, Tensor& y) {
 DecoderLayer::DecoderLayer(int layer_idx, bool is_attention_layer)
     : layer_idx_(layer_idx), is_attention_layer_(is_attention_layer) {
 
-    std::cout << "decoder layer idx: " << layer_idx << std::endl;
-    
-    
     // Load normalization layers
     std::stringstream ss_norm1, ss_norm2;
     ss_norm1 << "layers." << layer_idx << ".operator_norm.weight";
@@ -629,11 +621,10 @@ void LFM2Model::load_embeddings() {
 
 void LFM2Model::load_layers() {
     // std::cout << "Loading " << NUM_HIDDEN_LAYERS << " decoder layers..." << std::endl;
-    std::cout << "Loading layers from " << start_layer_ << " to " << end_layer_ << std::endl;
     
     // Read layer types from config.h LAYER_TYPES array
     // 0 = full_attention, 1 = conv
-    layers_.reserve(NUM_HIDDEN_LAYERS);
+    layers_.resize(NUM_HIDDEN_LAYERS);
     for (size_t i = 0; i < NUM_HIDDEN_LAYERS; i++) {
         // 내 범위 밖이면 패스 (nullptr로 남음)
         if (i < start_layer_ || i >= end_layer_) {
