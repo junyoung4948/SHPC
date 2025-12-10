@@ -23,11 +23,12 @@ private:
     int start_layer_;
     int end_layer_;
     int device_id_;
-    
+
     std::unique_ptr<ModelLoader> loader_;
     
     // Embeddings
-    Tensor embed_tokens_;
+    // Tensor embed_tokens_;
+    std::unique_ptr<Embedding> embedding_layer_;
     
     // Decoder layers
     std::vector<std::unique_ptr<DecoderLayer>> layers_;

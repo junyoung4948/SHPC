@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <numeric>
 #include "model_loader.h"
+#include <cuda_runtime.h> 
 
 // Global model loader is declared in model.h
 extern std::unique_ptr<ModelLoader> g_model_loader;
@@ -14,16 +15,16 @@ extern std::unique_ptr<ModelLoader> g_model_loader;
 // All tensor operations are implemented in layer.cu
 
 // Tensor constructors and destructors
-Tensor::Tensor() : size_(0), data_(nullptr), owns_data_(false), d_data_(nullptr) {}
+Tensor::Tensor() : size_(0), data_(nullptr), owns_data_(false), d_data_(nullptr), owns_device_data_(true) {}
 
 Tensor::Tensor(const std::vector<size_t>& shape) 
-    : shape_(shape), owns_data_(true), d_data_(nullptr) {
+    : shape_(shape), owns_data_(true), d_data_(nullptr), owns_device_data_(true) {
     size_ = compute_size();
     allocate();
 }
 
 Tensor::Tensor(const std::vector<size_t>& shape, float* data, bool copy)
-    : shape_(shape), owns_data_(copy), d_data_(nullptr) {
+    : shape_(shape), owns_data_(copy), d_data_(nullptr), owns_device_data_(copy) {
     size_ = compute_size();
     if (copy) {
         allocate();
@@ -45,12 +46,22 @@ void Tensor::to_device() {
     // 이미 할당되지 않은 경우에만 할당
     if (d_data_ == nullptr) {
         CHECK_CUDA(cudaMalloc((void**)&d_data_, size_ * sizeof(float)));
+        owns_device_data_ = true; 
     }
     
     // 데이터가 CPU에 있다면 복사
     if (data_ != nullptr) {
         CHECK_CUDA(cudaMemcpy(d_data_, data_, size_ * sizeof(float), cudaMemcpyHostToDevice));
     }
+}
+
+// [추가] 외부 포인터 주입
+void Tensor::set_external_device_data(float* ptr) {
+    // 기존에 가지고 있던 디바이스 메모리가 있고 소유권이 있다면 해제해야 함
+    free_device(); 
+
+    d_data_ = ptr;
+    owns_device_data_ = false; // 외부에서 관리하므로 나는 Free 하지 않음
 }
 
 // [추가됨] 데이터 복사 (GPU -> CPU)
@@ -70,10 +81,10 @@ void Tensor::free_host() {
 
 // [추가됨] GPU 메모리 해제
 void Tensor::free_device() {
-    if (d_data_ != nullptr) {
+    if (d_data_ != nullptr && owns_device_data_) {
         CHECK_CUDA(cudaFree(d_data_));
-        d_data_ = nullptr;
     }
+    d_data_ = nullptr;
 }
 
 // [추가] Transpose (CPU Only, 2D)

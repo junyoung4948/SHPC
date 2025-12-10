@@ -84,6 +84,9 @@ public:
     void to_host();     // GPU -> CPU 데이터 복사
     void free_device(); // GPU 메모리 해제
     void free_host();
+
+    // [추가] 외부 GPU 메모리 포인터를 설정 (소유권 없음 -> Free 하지 않음)
+    void set_external_device_data(float* ptr);
     
     // [추가됨] GPU 데이터 접근자
     float* device_data() { return d_data_; }
@@ -98,6 +101,7 @@ private:
 
     // [추가됨] GPU Memory Pointer
     float* d_data_ = nullptr;
+    bool owns_device_data_;  // [추가] Device data ownership flag (true면 소멸자에서 cudaFree)
     
     void allocate();
     void deallocate();
