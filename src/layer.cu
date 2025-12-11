@@ -481,7 +481,6 @@ void Embedding::forward(const int* d_input_ids, Tensor& output, int batch_size, 
     );
     
     // 커널 실행 에러 체크 (비동기라 실행 직후 에러만 잡음)
-    CHECK_CUDA(cudaGetLastError());
 }
 
 // RMSNorm implementation
@@ -541,8 +540,7 @@ void RotaryEmbedding::forward(size_t seq_len, Tensor& cos, Tensor& sin) {
     size_t head_dim = cos_cached_.size(1);
     size_t copy_size = seq_len * head_dim * sizeof(float);
 
-    // cos, sin 텐서는 외부(Workspace 등)에서 이미 공간이 할당되어 있다고 가정
-    CHECK_CUDA(cudaMemcpyAsync(cos.device_data(), cos_cached_.device_data(), copy_size, cudaMemcpyDeviceToDevice));
-    CHECK_CUDA(cudaMemcpyAsync(sin.device_data(), sin_cached_.device_data(), copy_size, cudaMemcpyDeviceToDevice));
+    cos.set_external_device_data(cos_cached_.device_data());
+    sin.set_external_device_data(sin_cached_.device_data());
 }
 

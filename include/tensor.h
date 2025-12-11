@@ -18,14 +18,16 @@
   } while (0)
 
 
-// Forward declaration
+// Forward declaration+
 class ModelLoader;
 
 class Tensor {
 public:
     // Constructors
     Tensor();
+    // [기존 유지] 기존 코드(model_loader 등) 호환용
     Tensor(const std::vector<size_t>& shape);
+    Tensor(const std::vector<size_t>& shape, bool allocate_host);
     Tensor(const std::vector<size_t>& shape, float* data, bool copy = true);
     ~Tensor();
     

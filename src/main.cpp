@@ -107,21 +107,49 @@ int main(int argc, char* argv[]) {
     std::string model_file = "/mnt/ramdisk/model.bin";
     std::string input_file = "data/inputs.bin";
     std::string output_file = "data/outputs.bin";
-    
-    ////////////////////////////////////////////////////////////////////
-    // INITIALIZATION                                                 //
-    ////////////////////////////////////////////////////////////////////
 
+    // ========================================================================
+    // 1. Device Assignment (Node당 2 Process, Process당 2 GPUs 가정)
+    // ========================================================================
+    // 로컬 랭크 계산 (간단히 짝수/홀수로 구분 가정. 실제 환경에 따라 OMPI_COMM_WORLD_LOCAL_RANK 사용 권장)
+    int local_rank = mpi_rank % 2; 
+    
+    // Rank 0 (Local 0): GPU 0 & 1
+    // Rank 1 (Local 1): GPU 2 & 3
+    int dev0 = local_rank * 2;
+    int dev1 = local_rank * 2 + 1;
+
+    // ========================================================================
+    // 2. Load Model Shards
+    // ========================================================================
+    if (mpi_rank == 0) fprintf(stdout, "Initializing Models...\n");
+    
+    // Shard 0: GPU 0 (Layers 0-12)
+    g_shard0 = std::make_unique<LFM2Model>(model_file, 0, 12, dev0);
+    
+    // Shard 1: GPU 1 (Layers 12-24)
+    g_shard1 = std::make_unique<LFM2Model>(model_file, 12, 24, dev1);
+
+    // ========================================================================
+    // 3. P2P Setup
+    // ========================================================================
+    // Shard 1의 입력 버퍼(hidden_states_) 주소를 가져와서 Shard 0에게 알려줌
+    float* peer_ptr = g_shard1->get_hidden_states_ptr();
+    g_shard0->set_peer_input_buffer(peer_ptr, dev1);
+    
+    if (mpi_rank == 0) fprintf(stdout, "P2P Link Established (GPU %d -> GPU %d)\n", dev0, dev1);
+
+    // ========================================================================
+    // 4. Data Preparation (Host)
+    // ========================================================================
     int *inputs = nullptr;
     float *outputs = nullptr;
     int32_t total_samples = 0;
     int32_t seq_length = 0;
 
-    /* Only MPI process rank 0 has the inputs and outputs */
-    if (mpi_rank == 0) fprintf(stdout, "Initializing inputs and outputs...");
-    
     if (mpi_rank == 0) {
-        // Read input file to get dimensions and data
+        fprintf(stdout, "Initializing inputs and outputs...");
+        // Read Input File
         std::ifstream infile(input_file, std::ios::binary);
         if (!infile) {
             fprintf(stderr, "Failed to open input file: %s\n", input_file.c_str());
@@ -138,9 +166,11 @@ int main(int argc, char* argv[]) {
         fprintf(stdout, "  Processing samples: %d\n", num_samples);
         fprintf(stdout, "\n");
 
-        // Allocate pinned memory for inputs
+        // Allocate Host Pinned Memory
         CHECK_CUDA(cudaMallocHost(&inputs, num_samples * seq_length * sizeof(int)));
+        CHECK_CUDA(cudaMallocHost(&outputs, num_samples * VOCAB_SIZE * sizeof(float)));
         
+        // Read Data
         // Read all input samples into buffer
         for (int i = 0; i < num_samples; i++) {
             std::vector<int32_t> temp_input(seq_length);
@@ -156,116 +186,105 @@ int main(int argc, char* argv[]) {
                 inputs[i * seq_length + j] = static_cast<int>(temp_input[j]);
             }
         }
-        
         infile.close();
-
-        // Allocate pinned memory for outputs
-        CHECK_CUDA(cudaMallocHost(&outputs, num_samples * VOCAB_SIZE * sizeof(float)));
     }
+    // ========================================================================
+    // 5. Pre-allocate Device Buffers (No Malloc in Loop)
+    // ========================================================================
+    int batch_size = std::min(128, num_samples);
+    
+    // [GPU 0] Input Buffer
+    int* d_inputs_shard0 = nullptr;
+    CHECK_CUDA(cudaSetDevice(dev0));
+    CHECK_CUDA(cudaMalloc(&d_inputs_shard0, batch_size * seq_length * sizeof(int)));
 
-    // Load model
-    // if (mpi_rank == 0) 
-    // LFM2Model model(model_file);
-    /* -------------------------------------------------------------------------
-     * Step 1: Multi-GPU Partial Loading
-     * ------------------------------------------------------------------------- */
-    if (mpi_rank == 0) {
-        fprintf(stdout, "Loading model from %s...", model_file.c_str());
+    // [GPU 1] Output Buffer (Logits)
+    float* d_logits_shard1 = nullptr;
+    CHECK_CUDA(cudaSetDevice(dev1));
+    CHECK_CUDA(cudaMalloc(&d_logits_shard1, batch_size * VOCAB_SIZE * sizeof(float)));
 
-        // --- GPU 0: Part A 로드 ---
-        // start=0, end=12 (Embedding 포함, 0~11 Layer)
-        std::cout << "\n[Main] Loading Shard 0 on GPU 0..." << std::endl;
-        g_shard0 = std::make_unique<LFM2Model>(model_file, 0, 12, 0);
+    // Wrapper Tensor for Logits (No Alloc, just view)
+    Tensor logits_wrapper({(size_t)batch_size, (size_t)VOCAB_SIZE}, false);
+    logits_wrapper.set_external_device_data(d_logits_shard1);
 
-        // --- GPU 1: Part B 로드 ---
-        // start=12, end=24 (12~23 Layer + Output)
-        std::cout << "\n[Main] Loading Shard 1 on GPU 1..." << std::endl;
-        g_shard1 = std::make_unique<LFM2Model>(model_file, 12, 24, 1);
-        
-        std::cout << "\n[Main] All shards loaded successfully!" << std::endl;
-        
-        // 메모리 점검 출력
-        size_t free, total;
-        
-        cudaSetDevice(0);
-        cudaMemGetInfo(&free, &total);
-        std::cout << "[GPU 0] Free Memory: " << free / (1024.0*1024.0*1024.0) << " GB / " 
-                  << total / (1024.0*1024.0*1024.0) << " GB" << std::endl;
-        
-        cudaSetDevice(1);
-        cudaMemGetInfo(&free, &total);
-        std::cout << "[GPU 1] Free Memory: " << free / (1024.0*1024.0*1024.0) << " GB / " 
-                  << total / (1024.0*1024.0*1024.0) << " GB" << std::endl;
-    }
+    // Dummy Wrapper for Shard 0 Logits (Ignored) shard 0 doesn't need logit tensor
+    Tensor dummy_logits({}, false);
 
-    // /* Warm-up */
-    // if (run_warmup && mpi_rank == 0) {
-    //     fprintf(stdout, "Warming up...");
-    //     std::vector<int> warmup_input(inputs, inputs + seq_length);
-    //     Tensor warmup_logits;
-    //     for (int i = 0; i < 3; i++) {
-    //         model.forward(warmup_input, warmup_logits);
-    //     }
-    //     fprintf(stdout, "Done!\n\n");
-    // }
-
-    // ////////////////////////////////////////////////////////////////////
-    // // MODEL COMPUTATION                                              //
-    // ////////////////////////////////////////////////////////////////////
-
-    double st = 0.0, et = 0.0;
-
-    // if (mpi_rank == 0) {
-    //     fprintf(stdout, "Generating...");
-    //     fflush(stdout);
-    // }
-
-    // for (size_t i = 0; i < 4; i++) {
-    //     CHECK_CUDA(cudaSetDevice(i));
-    //     CHECK_CUDA(cudaDeviceSynchronize());
-    // }
-    // CHECK_CUDA(cudaSetDevice(0));
-    // MPI_Barrier(MPI_COMM_WORLD);
-
-    // if (mpi_rank == 0) st = get_time();
-
-    // /* Call the main computation */
-    // if (mpi_rank == 0) {
-    //     for (int sample_idx = 0; sample_idx < num_samples; sample_idx++) {
-    //         // Get input for this sample
-    //         std::vector<int> input_ids_vec(inputs + sample_idx * seq_length, 
-    //                                       inputs + (sample_idx + 1) * seq_length);
-            
-    //         // Run forward pass
-    //         Tensor logits;
-    //         model.forward(input_ids_vec, logits);
-            
-    //         // Copy logits to output buffer
-    //         for (size_t i = 0; i < VOCAB_SIZE; i++) {
-    //             outputs[sample_idx * VOCAB_SIZE + i] = logits.at(0, i);
-    //         }
-    //     }
-    // }
-
-    for (size_t i = 0; i < 4; i++) {
-        CHECK_CUDA(cudaSetDevice(i));
+    // ========================================================================
+    // 6. Warm-up
+    // ========================================================================
+    if (run_warmup && mpi_rank == 0) {
+        fprintf(stdout, "Warming up...\n");
+        // Simple warm-up with dummy data (skip H2D copy for speed)
+        g_shard0->forward(d_inputs_shard0, dummy_logits, batch_size, seq_length);
+        g_shard1->forward(nullptr, logits_wrapper, batch_size, seq_length);
         CHECK_CUDA(cudaDeviceSynchronize());
+        fprintf(stdout, "Done!\n");
     }
-    CHECK_CUDA(cudaSetDevice(0));
+
+    // ========================================================================
+    // 7. Inference Loop (Naive Pipeline)
+    // ========================================================================
     MPI_Barrier(MPI_COMM_WORLD);
+    double st = get_time();
 
     if (mpi_rank == 0) {
-        et = get_time();
-        /* Print the result */
+        fprintf(stdout, "Running Inference...\n");
+        
+        int samples_processed = 0;
+        
+        // Loop over total samples in chunks of batch_size
+        while (samples_processed < num_samples) {
+            int current_batch = std::min(batch_size, num_samples - samples_processed);
+            
+            // A. Copy Inputs Host -> Device (GPU 0)
+            CHECK_CUDA(cudaSetDevice(dev0));
+            CHECK_CUDA(cudaMemcpyAsync(d_inputs_shard0, 
+                                     inputs + samples_processed * seq_length, 
+                                     current_batch * seq_length * sizeof(int), 
+                                     cudaMemcpyHostToDevice));
+
+            // B. Shard 0 Forward (GPU 0)
+            // - Computes Layer 0-11
+            // - P2P Copies result to GPU 1's hidden_states_ buffer
+            // - Synchronizes stream (Naive)
+            g_shard0->forward(d_inputs_shard0, dummy_logits, current_batch, seq_length);
+            
+            // C. Shard 1 Forward (GPU 1)
+            // - Waits for data (Already there due to sync in Shard 0)
+            // - Computes Layer 12-23 + Head
+            // - Writes result to d_logits_shard1
+            g_shard1->forward(nullptr, logits_wrapper, current_batch, seq_length);
+            
+            // D. Copy Outputs Device -> Host (GPU 1)
+            CHECK_CUDA(cudaSetDevice(dev1));
+            CHECK_CUDA(cudaMemcpy(outputs + samples_processed * VOCAB_SIZE,
+                                d_logits_shard1,
+                                current_batch * VOCAB_SIZE * sizeof(float),
+                                cudaMemcpyDeviceToHost));
+            
+            samples_processed += current_batch;
+        }
+    }
+
+    MPI_Barrier(MPI_COMM_WORLD);
+    double et = get_time();
+
+    if (mpi_rank == 0) {
         fprintf(stdout, "Done!\n");
         fprintf(stdout, "Elapsed time: %lf (sec)\n", et - st);
-        fprintf(stdout, "Throughput: %lf (samples/sec)\n\n", 
-                num_samples / (et - st));
+        fprintf(stdout, "Throughput: %lf (samples/sec)\n\n", num_samples / (et - st));
     }
 
-    ////////////////////////////////////////////////////////////////////
-    // FINALIZATION                                                   //
-    ////////////////////////////////////////////////////////////////////
+    // ========================================================================
+    // 8. Finalization (Original Validation Logic)
+    // ========================================================================
+
+    // Cleanup Device Buffers
+    CHECK_CUDA(cudaSetDevice(dev0));
+    CHECK_CUDA(cudaFree(d_inputs_shard0));
+    CHECK_CUDA(cudaSetDevice(dev1));
+    CHECK_CUDA(cudaFree(d_logits_shard1));
 
     if (mpi_rank == 0) {
         /* Save outputs */
@@ -380,13 +399,12 @@ int main(int argc, char* argv[]) {
         CHECK_CUDA(cudaFreeHost(inputs));
         CHECK_CUDA(cudaFreeHost(outputs));
     }
-    if (mpi_rank == 0) {
-        std::cout << "[Main] Cleaning up resources..." << std::endl;
-        g_shard0.reset(); // Shard 0 소멸 (cudaFree 호출)
-        g_shard1.reset(); // Shard 1 소멸 (cudaFree 호출)
-    }
+    
+    // Resource cleanup
+    if (mpi_rank == 0) std::cout << "[Main] Cleaning up resources..." << std::endl;
+    g_shard0.reset();
+    g_shard1.reset();
 
-    /* MPI Finalization */
     MPI_Finalize();
     return 0;
 }

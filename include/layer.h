@@ -62,7 +62,7 @@ private:
 class SparseMoeBlock {
 public:
     SparseMoeBlock(int layer_idx);
-    void forward(const Tensor& x, Tensor& y, Tensor& router_logits, float* workspace = nullptr);
+    void forward(const Tensor& x, Tensor& y, float* workspace = nullptr);
     
 private:
     Tensor gate_;  // router
@@ -89,6 +89,10 @@ private:
     int layer_idx_;
     cudaStream_t stream_q_;
     cudaStream_t stream_k_;
+
+    cudaEvent_t event_start_; // "입력 x 준비 완료" 신호
+    cudaEvent_t event_q_done_; // "Q 계산 완료" 신호
+    cudaEvent_t event_k_done_; // "K 계산 완료" 신호
 };
 
 // Short Convolution (Mamba-style)

@@ -8,21 +8,49 @@
 #include "model_loader.h"
 #include <cuda_runtime.h> 
 
+
+// [추가] Transpose Kernel (Tiled optimization for coalesced memory access)
+__global__ void transpose_kernel(const float* __restrict__ in, float* __restrict__ out, int rows, int cols) {
+    // 32x32 Tile + 1 padding to avoid shared memory bank conflicts
+    __shared__ float tile[32][33];
+
+    int x = blockIdx.x * 32 + threadIdx.x;
+    int y = blockIdx.y * 32 + threadIdx.y;
+
+    // 1. Load data from global memory to shared memory
+    if (y < rows && x < cols) {
+        // Coalesced read
+        tile[threadIdx.y][threadIdx.x] = in[y * cols + x];
+    }
+
+    __syncthreads();
+
+    // 2. Compute new coordinates for transpose
+    x = blockIdx.y * 32 + threadIdx.x;
+    y = blockIdx.x * 32 + threadIdx.y;
+
+    // 3. Write data from shared memory to global memory
+    if (y < cols && x < rows) {
+        // Coalesced write
+        out[y * rows + x] = tile[threadIdx.x][threadIdx.y];
+    }
+}
+
 // Global model loader is declared in model.h
 extern std::unique_ptr<ModelLoader> g_model_loader;
-
 // Tensor class implementation - structure and data management only
 // All tensor operations are implemented in layer.cu
 
 // Tensor constructors and destructors
 Tensor::Tensor() : size_(0), data_(nullptr), owns_data_(false), d_data_(nullptr), owns_device_data_(true) {}
 
-Tensor::Tensor(const std::vector<size_t>& shape) 
+Tensor::Tensor(const std::vector<size_t>& shape, bool allocate_host) 
     : shape_(shape), owns_data_(true), d_data_(nullptr), owns_device_data_(true) {
     size_ = compute_size();
-    allocate();
+    if (allocate_host)  allocate();
+    else                data_ = nullptr;
 }
-
+Tensor::Tensor(const std::vector<size_t>& shape) : Tensor(shape, true) {}
 Tensor::Tensor(const std::vector<size_t>& shape, float* data, bool copy)
     : shape_(shape), owns_data_(copy), d_data_(nullptr), owns_device_data_(copy) {
     size_ = compute_size();
@@ -85,18 +113,12 @@ void Tensor::free_device() {
         CHECK_CUDA(cudaFree(d_data_));
     }
     d_data_ = nullptr;
+    owns_device_data_ = true;
 }
 
 // [추가] Transpose (CPU Only, 2D)
 void Tensor::transpose() {
 
-    // 1. 데이터가 없거나 차원이 안 맞으면 중단
-    if (data_ == nullptr || shape_.size() != 2) {
-        std::cerr << "Error: Invalid transpose target. data=" << data_ 
-                  << ", ndim=" << shape_.size() << std::endl;
-        return;
-    }
-    
     // 1. 차원 체크
     if (shape_.size() != 2) {
         std::cerr << "Error: Tensor::transpose only supports 2D tensors." << std::endl;
@@ -104,7 +126,7 @@ void Tensor::transpose() {
     }
     
     // 2. 경고: 이미 GPU에 데이터가 올라가 있다면 싱크가 안 맞을 수 있음
-    if (d_data_ != nullptr) {
+    if (d_data_ != nullptr && !owns_device_data_ ) {
         std::cerr << "Warning: Transpose called after to_device(). GPU data will not reflect changes unless to_device() is called again." << std::endl;
     }
 
@@ -118,25 +140,32 @@ void Tensor::transpose() {
         return;
    }
 
-    // 3. 임시 버퍼 생성 
-    std::vector<float> new_data(size_);
+   // 3. 결과 담을 임시 GPU 버퍼 할당
+   float* d_new = nullptr;
+   CHECK_CUDA(cudaMalloc(&d_new, size_ * sizeof(float)));
 
-    // 4. Transpose 수행 (Cache miss가 발생하지만 1회성이므로 허용)
-    // data_가 [rows][cols]라고 가정하고 new_data를 [cols][rows]로 채움
-    #pragma omp parallel for collapse(2) // OpenMP가 있다면 성능 향상 가능 (없어도 무방)
-    for (size_t r = 0; r < rows; ++r) {
-        for (size_t c = 0; c < cols; ++c) {
-            // new_data[c, r] = old_data[r, c]
-            new_data[c * rows + r] = data_[r * cols + c];
-        }
-    }
+   // 4. Kernel Launch
+   dim3 block(32, 32);
+   dim3 grid((cols + 31) / 32, (rows + 31) / 32);
 
-    // 5. 데이터 덮어쓰기
-    std::memcpy(data_, new_data.data(), size_ * sizeof(float));
+   transpose_kernel<<<grid, block>>>(d_data_, d_new, rows, cols);
+   CHECK_CUDA(cudaDeviceSynchronize());
 
-    // 6. Shape 변경
-    shape_[0] = cols;
-    shape_[1] = rows;
+   // 5. 교체 및 정리
+   CHECK_CUDA(cudaFree(d_data_)); // 기존 GPU 데이터 해제
+   d_data_ = d_new;               // 새 포인터 연결
+   
+   // Shape 변경
+   shape_[0] = cols;
+   shape_[1] = rows;
+
+   // [중요] Host 데이터와의 불일치 해결
+   // GPU에서 변형되었으므로 Host 데이터는 더 이상 유효하지 않음.
+   // 메모리 절약을 위해 Host 메모리 해제
+   if (data_) {
+       free_host(); 
+   }
+
 }
 
 // Copy constructor only cpu
@@ -172,11 +201,13 @@ Tensor& Tensor::operator=(const Tensor& other) {
 // Move constructor
 Tensor::Tensor(Tensor&& other) noexcept
     : shape_(std::move(other.shape_)), size_(other.size_),
-      data_(other.data_), owns_data_(other.owns_data_), d_data_(other.d_data_){
+      data_(other.data_), owns_data_(other.owns_data_), d_data_(other.d_data_),
+      owns_device_data_(other.owns_device_data_) {
     other.data_ = nullptr;
     other.size_ = 0;
     other.owns_data_ = false;
     other.d_data_ = nullptr;
+    other.owns_device_data_ = true;
 }
 
 // Move assignment
@@ -189,11 +220,13 @@ Tensor& Tensor::operator=(Tensor&& other) noexcept {
         data_ = other.data_;
         owns_data_ = other.owns_data_;
         d_data_ = other.d_data_;
+        owns_device_data_ = other.owns_device_data_;
         
         other.data_ = nullptr;
         other.size_ = 0;
         other.owns_data_ = false;
         other.d_data_ = nullptr;
+        other.owns_device_data_ = true;
     }
     return *this;
 }

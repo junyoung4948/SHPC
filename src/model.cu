@@ -19,7 +19,35 @@ __device__ __forceinline__ float warpReduceSum(float val) {
         val += __shfl_xor_sync(0xffffffff, val, offset);
     return val;
 }
+__global__ void mlp_fuse_transpose_kernel(
+    const float* __restrict__ w1, 
+    const float* __restrict__ w3, 
+    float* __restrict__ w13, 
+    int intermediate_size, 
+    int hidden_size) 
+{
+    // Output Coordinates: w13[row, col]
+    // row corresponds to Hidden Dimension
+    // col corresponds to 2*Intermediate Dimension
+    int row = blockIdx.y * blockDim.y + threadIdx.y; // 0 .. Hidden
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // 0 .. 2*Int
 
+    if (row < hidden_size && col < 2 * intermediate_size) {
+        float val = 0.0f;
+        
+        // Load from W1 or W3 (Transposed access)
+        // W1 shape: [Int, Hidden] -> We want W1[col, row]
+        if (col < intermediate_size) {
+            val = w1[col * hidden_size + row]; 
+        } else {
+            // W3 shape: [Int, Hidden] -> We want W3[col-Int, row]
+            val = w3[(col - intermediate_size) * hidden_size + row];
+        }
+        
+        // Store to W13 [Hidden, 2*Int]
+        w13[row * (2 * intermediate_size) + col] = val;
+    }
+}
 // ============================================================================
 // Slice Last Token Kernel
 // Input:  [Batch, Seq, Hidden]
@@ -877,11 +905,12 @@ std::unique_ptr<ModelLoader> g_model_loader;
 // ============================================================================
 static void load_weight_optimized(Tensor& tensor, const std::string& path, bool do_transpose) {
     tensor = Tensor::load_from_file(path);
+    
+    tensor.to_device();     // GPU 메모리 할당 및 복사
+    tensor.free_host();     // CPU 메모리 해제
     if (do_transpose) {
         tensor.transpose(); // Linear Layer인 경우 A x B^T -> A x B로 변환
     }
-    tensor.to_device();     // GPU 메모리 할당 및 복사
-    tensor.free_host();     // CPU 메모리 해제
 }
 
 // ============================================================================
@@ -903,50 +932,45 @@ void transpose_on_host(float *dst, const float *src, int rows, int cols) {
 // MLP (Feed-Forward Network) implementation
 MLP::MLP(const std::string& w1_file, const std::string& w2_file, const std::string& w3_file) {
 
-    Tensor h_w1 = Tensor::load_from_file(w1_file); // [Intermediate, Hidden]
-    Tensor h_w3 = Tensor::load_from_file(w3_file); // [Intermediate, Hidden]
-    
-    int intermediate_size = h_w1.size(0);
-    int hidden_size = h_w1.size(1);
 
     // 2. Prepare Fused W13 [Hidden, 2 * Intermediate]
     // Kernel expects B matrix to be [K, N] = [Hidden, 2*Intermediate]
     // We construct this by transposing W1 and W3 to [Hidden, Intermediate]
     // and concatenating them along the last dimension.
-    
-    int fused_dim = 2 * intermediate_size;
-    std::vector<float> h_w13_data(hidden_size * fused_dim);
-    
-    // Temporary buffers for transposition
-    std::vector<float> w1_T(hidden_size * intermediate_size);
-    std::vector<float> w3_T(hidden_size * intermediate_size);
-    
-    // Transpose W1, W3: [Int, Hidden] -> [Hidden, Int]
-    transpose_on_host(w1_T.data(), h_w1.data(), intermediate_size, hidden_size);
-    transpose_on_host(w3_T.data(), h_w3.data(), intermediate_size, hidden_size);
-    
-    // Interleave/Fuse into W13
-    // Row r of W13 = [ Row r of W1_T | Row r of W3_T ]
-    for (int r = 0; r < hidden_size; r++) {
-        // Copy W1 part to first half
-        std::memcpy(h_w13_data.data() + r * fused_dim, 
-                    w1_T.data() + r * intermediate_size, 
-                    intermediate_size * sizeof(float));
-                    
-        // Copy W3 part to second half
-        std::memcpy(h_w13_data.data() + r * fused_dim + intermediate_size, 
-                    w3_T.data() + r * intermediate_size, 
-                    intermediate_size * sizeof(float));
-    }
 
-    // 4. Create Device Tensors
-    // Tensor constructor with copy=true allocates device memory (if configured) or host first?
-    // Based on tensor.h/cu, constructor(shape, data, copy) creates host tensor.
-    // We then call to_device() to move it to GPU.
+    Tensor w1 = Tensor::load_from_file(w1_file); 
+    w1.to_device(); 
+    w1.free_host();
+
+    Tensor w3 = Tensor::load_from_file(w3_file);
+    w3.to_device();
+    w3.free_host();
     
-    w13_ = Tensor({(size_t)hidden_size, (size_t)fused_dim}, h_w13_data.data(), true);
+    int intermediate_size = w1.size(0);
+    int hidden_size = w1.size(1);
+    int fused_dim = 2 * intermediate_size;
+
+    // 2. Prepare W13 Output Buffer on GPU
+    // allocate_host=false: Host 메모리 할당 없음
+    w13_ = Tensor({(size_t)hidden_size, (size_t)fused_dim}, false);
     w13_.to_device(); 
-    w13_.free_host(); 
+    
+    // 3. Launch Fused Transpose Kernel
+    {
+        // Block: 32x32
+        dim3 block(32, 32);
+        // Grid: Covers (FusedDim, HiddenSize)
+        dim3 grid((fused_dim + 31) / 32, (hidden_size + 31) / 32);
+        
+        mlp_fuse_transpose_kernel<<<grid, block>>>(
+            w1.device_data(), 
+            w3.device_data(), 
+            w13_.device_data(), 
+            intermediate_size, 
+            hidden_size
+        );
+        CHECK_CUDA(cudaDeviceSynchronize()); 
+    }
 
     load_weight_optimized(w2_, w2_file, true);
     
@@ -961,7 +985,7 @@ void MLP::forward(const Tensor& x, Tensor& y, float* workspace) {
     size_t hidden_size = x.size(2);
     int M = batch * seq_len;
     
-    if (y.size() == 0) y = Tensor({batch, seq_len, hidden_size}); // Output Alloc
+    if (y.size() == 0) std::cerr << "no output buffer in MLP" << std::endl;
     
     // Raw Pointer로 위임
     forward_raw(x.device_data(), y.device_data(), M, workspace);
@@ -1052,7 +1076,7 @@ SparseMoeBlock::SparseMoeBlock(int layer_idx) {
 }
 
 
-void SparseMoeBlock::forward(const Tensor& x, Tensor& y, Tensor& router_logits, float* workspace) {
+void SparseMoeBlock::forward(const Tensor& x, Tensor& y, float* workspace) {
     // x: (batch, seq_len, hidden_size)
     size_t batch = x.size(0);
     size_t seq_len = x.size(1);
@@ -1210,11 +1234,21 @@ Attention::Attention(int layer_idx) : layer_idx_(layer_idx){
 
     CHECK_CUDA(cudaStreamCreate(&stream_q_));
     CHECK_CUDA(cudaStreamCreate(&stream_k_));
+
+    // [추가] Event 생성 (Flags: cudaEventDisableTiming로 성능 최적화)
+    CHECK_CUDA(cudaEventCreateWithFlags(&event_start_, cudaEventDisableTiming));
+    CHECK_CUDA(cudaEventCreateWithFlags(&event_q_done_, cudaEventDisableTiming));
+    CHECK_CUDA(cudaEventCreateWithFlags(&event_k_done_, cudaEventDisableTiming));
 }
 
 Attention::~Attention() {
     if (stream_q_) cudaStreamDestroy(stream_q_);
     if (stream_k_) cudaStreamDestroy(stream_k_);
+
+    // [추가] Event 제거
+    if (event_start_) cudaEventDestroy(event_start_);
+    if (event_q_done_) cudaEventDestroy(event_q_done_);
+    if (event_k_done_) cudaEventDestroy(event_k_done_);
 }
 
 void Attention::forward(const Tensor& x, const Tensor& cos, const Tensor& sin,
@@ -1247,6 +1281,13 @@ void Attention::forward(const Tensor& x, const Tensor& cos, const Tensor& sin,
 
     // x_gpu는 이미 입력 Tensor x.device_data()로 존재
     const float* x_gpu = x.device_data();
+    // 1. Default Stream(0)에서 "현재까지의 작업(x 계산) 완료" 깃발을 꽂습니다.
+    CHECK_CUDA(cudaEventRecord(event_start_, 0));
+
+    // 2. stream_q와 stream_k는 이 깃발이 꽂힐 때까지 대기합니다.
+    // (CPU는 멈추지 않고, GPU 내부에서 해당 스트림만 대기합니다)
+    CHECK_CUDA(cudaStreamWaitEvent(stream_q_, event_start_, 0));
+    CHECK_CUDA(cudaStreamWaitEvent(stream_k_, event_start_, 0));
     int kv_size = NUM_KEY_VALUE_HEADS * HEAD_DIM;
     
     // =================================================================
@@ -1290,6 +1331,7 @@ void Attention::forward(const Tensor& x, const Tensor& cos, const Tensor& sin,
         q_proj_out_gpu, q_transposed_gpu, q_norm_->weight().device_data(),
         cos.device_data(), sin.device_data(), seq_len, NUM_ATTENTION_HEADS, HEAD_DIM, 1e-5f
     );
+    CHECK_CUDA(cudaEventRecord(event_q_done_, stream_q_));
 
     // K RoPE
     dim3 grid_rope_k(seq_len, NUM_KEY_VALUE_HEADS, batch);
@@ -1297,9 +1339,10 @@ void Attention::forward(const Tensor& x, const Tensor& cos, const Tensor& sin,
         k_proj_out_gpu, k_transposed_gpu, k_norm_->weight().device_data(),
         cos.device_data(), sin.device_data(), seq_len, NUM_KEY_VALUE_HEADS, HEAD_DIM, 1e-5f
     );
+    CHECK_CUDA(cudaEventRecord(event_k_done_, stream_k_));
 
-    CHECK_CUDA(cudaDeviceSynchronize()); // Wait for Q/K prep
-    
+    CHECK_CUDA(cudaStreamWaitEvent(0, event_q_done_, 0)); // Default Stream Waits for Q
+    CHECK_CUDA(cudaStreamWaitEvent(0, event_k_done_, 0)); // Default Stream Waits for K
    
     
     // =================================================================
@@ -1550,40 +1593,59 @@ DecoderLayer::DecoderLayer(int layer_idx, bool is_attention_layer)
 }
 
 void DecoderLayer::forward(const Tensor& x, const Tensor& cos, const Tensor& sin,
-                          const Tensor* attention_mask, Tensor& output) {
+                          const Tensor* attention_mask, Tensor& output, float* workspace) {
     // Input norm
-    Tensor normed_input(x.shape());
+    float* curr = workspace;
+
+    // Norm 결과를 담을 임시 Tensor 생성 (메모리는 workspace 사용)
+    Tensor normed_input({x.shape()}, false);
+    normed_input.set_external_device_data(curr); 
+    // x와 같은 크기만큼 workspace 전진
+    // 주의: x.size()는 element count이므로 float bytes 고려 필요없음(pointer arithmetic)
+    size_t x_elems = x.size(); 
+    
+    // Sub-modules용 workspace (normed_input 뒤 공간)
+    float* sub_workspace = curr + x_elems;
     input_layernorm_->forward(x, normed_input);
-    
-    // Attention or Conv
-    Tensor attn_output(x.shape());
+
+    // 2. Attention or Conv
+    // 결과는 output 텐서에 임시로 저장했다가 residual add 할 수도 있고,
+    // 별도 버퍼를 쓸 수도 있음. 
+    // 여기서는 attn_output이라는 별도 텐서(buffer)를 workspace에서 할당
+    Tensor attn_output({x.shape()}, false);
+    attn_output.set_external_device_data(sub_workspace);
+    // sub_workspace를 attn_output 뒤로 밀어줌
+    float* inner_workspace = sub_workspace + x_elems;
+
     if (is_attention_layer_) {
-        self_attn_->forward(normed_input, cos, sin, attention_mask, attn_output);
+        self_attn_->forward(normed_input, cos, sin, attention_mask, attn_output, inner_workspace);
     } else {
-        short_conv_->forward(normed_input, attn_output);
+        short_conv_->forward(normed_input, attn_output, inner_workspace);
     }
+    // 3. Residual 1: x + attn_output -> hidden_states (여기선 output 변수 재활용 또는 x가 const라 안됨)
+    // 최적화: output 버퍼에 x + attn_output 결과를 저장
+    tensor_ops::add(x, attn_output, output);
+
+    // 4. Post Attention Norm
+    // output(hidden_states)을 입력으로 Norm. 결과는 normed_input 버퍼 재활용 가능!
+    post_attention_layernorm_->forward(output, normed_input);
+
+    // 5. MLP or MoE
+    // 결과는 attn_output 버퍼 재활용 가능 (이미 더해졌으므로 필요 없음)
+    // Tensor ffn_output = attn_output;
     
-    // Residual connection
-    Tensor hidden_states(x.shape());
-    tensor_ops::add(x, attn_output, hidden_states);
-    
-    // Post attention norm
-    Tensor normed_hidden(x.shape());
-    post_attention_layernorm_->forward(hidden_states, normed_hidden);
     
     // MoE block or dense MLP
-    Tensor ffn_output;
     if (moe_block_) {
         // MoE layer (layers >= 2)
-        Tensor router_logits;
-        moe_block_->forward(normed_hidden, ffn_output, router_logits);
+        moe_block_->forward(normed_input, attn_output, inner_workspace);
     } else {
         // Dense layer (layers 0-1)
-        dense_mlp_->forward(normed_hidden, ffn_output);
+        dense_mlp_->forward(normed_input, attn_output, inner_workspace);
     }
     
     // Residual connection
-    tensor_ops::add(hidden_states, ffn_output, output);
+    tensor_ops::add(output, attn_output, output);
 }
 
 // ============================================================================
@@ -1596,6 +1658,17 @@ LFM2Model::LFM2Model(const std::string& model_file, int start_layer, int end_lay
 
     // 해당 GPU 컨텍스트 설정 
     CHECK_CUDA(cudaSetDevice(device_id_));
+    CHECK_CUDA(cudaStreamCreate(&stream_));
+
+    // 2. P2P Enable (Naive: 내 파트너 GPU에 대해 접근 허용)
+    // Shard 0 <-> Shard 1
+    int peer_id = (device_id_ % 2 == 0) ? device_id_ + 1 : device_id_ - 1;
+    cudaError_t err = cudaDeviceEnablePeerAccess(peer_id, 0);
+    if (err != cudaSuccess && err != cudaErrorPeerAccessAlreadyEnabled) {
+        // P2P 불가능 환경일 수 있음 (경고만 출력하고 진행, Copy 시 fallback 됨)
+        std::cerr << "[Warning] Device " << device_id_ << " cannot access peer " << peer_id << std::endl;
+    }
+
     std::cout << "[Model] Initializing on Device " << device_id_ 
               << " (Layers " << start_layer_ << "~" << end_layer_ << ")" << std::endl;
     
@@ -1617,8 +1690,51 @@ LFM2Model::LFM2Model(const std::string& model_file, int start_layer, int end_lay
     
     // Initialize RoPE
     rotary_emb_ = std::make_unique<RotaryEmbedding>();
+
+    // 4. Pre-allocate Buffers (Giant Workspace & Hidden States)
+    allocate_buffers();
+    CHECK_CUDA(cudaDeviceSynchronize());
+    std::cout << "[Model] Device " << device_id_ << " loaded successfully!" << std::endl;
+}
+
+LFM2Model::~LFM2Model() {
+    if (stream_) cudaStreamDestroy(stream_);
+    // Tensors automatically freed
+}
+
+void LFM2Model::allocate_buffers() {
+    // 1. Giant Workspace Allocation
+    // 최대 Layer 연산(Attn/MoE)을 커버할 충분한 크기 (예: 1GB)
+    // 256M floats * 4 bytes = 1GB
+    size_t workspace_elements = 256 * 1024 * 1024; 
+    workspace_ = Tensor({workspace_elements});
+    workspace_.to_device(); // cudaMalloc
     
-    std::cout << "Model loaded successfully!" << std::endl;
+    // 2. Hidden States Buffer Allocation
+    // 최대 Batch=128, Seq=512 (혹은 1024)를 커버하도록 넉넉히 할당
+    // PP 통신 시 Shard 1은 이 버퍼를 '수신용'으로 사용함.
+    size_t max_batch = 128; 
+    size_t max_seq = 16; // 512 tokens
+    size_t hidden_size = HIDDEN_SIZE;
+    
+    hidden_states_ = Tensor({max_batch, max_seq, hidden_size});
+    hidden_states_.to_device();
+    
+    // 3. Output Buffers (Shard 1 Only)
+    if (end_layer_ >= NUM_HIDDEN_LAYERS) {
+        last_hidden_ = Tensor({max_batch, hidden_size});
+        last_hidden_.to_device();
+    }
+    
+}
+
+void LFM2Model::set_peer_input_buffer(float* peer_ptr, int peer_device) {
+    peer_input_ptr_ = peer_ptr;
+    peer_device_id_ = peer_device;
+}
+
+float* LFM2Model::get_hidden_states_ptr() {
+    return hidden_states_.device_data();
 }
 
 void LFM2Model::load_embeddings() {
@@ -1651,84 +1767,91 @@ void LFM2Model::load_output_layers() {
     
     // LM head might share weights with embeddings
     if (g_model_loader->has_tensor("lm_head.weight")) {
-        lm_head_ = Tensor::load_from_file("lm_head.weight");
+        load_weight_optimized(lm_head_, "lm_head.weight", true);
     } else {
         // Use tied weights (same as embeddings)
-        lm_head_ = Tensor::load_from_file("embed_tokens.weight");
-        std::cout << "  Using tied weights for LM head" << std::endl;
+        load_weight_optimized(lm_head_, "embed_tokens.weight", true);
     }
-    lm_head_.transpose(); 
-    lm_head_.to_device();
-    lm_head_.free_host();
 }
 
-void LFM2Model::forward(const std::vector<int>& input_ids, Tensor& logits) {
-    size_t batch = 1;
-    size_t seq_len = input_ids.size();
-    
-    // 1. Embedding 실행 (수천만 번의 메모리 읽기)
-    embedding_layer_->forward(d_input_ids, hidden_states, batch_size, seq_len);
+void LFM2Model::forward(const int* d_input_ids, Tensor& logits, int batch, int seq_len) {
+    CHECK_CUDA(cudaSetDevice(device_id_));
 
-    // 2. RoPE 준비 (단순 복사, 마이크로초 단위로 끝남)
-    // 별도의 커널 런치 오버헤드 걱정 안 해도 될 만큼 빠름
-    rotary_emb_->forward(seq_len, cos_tensor, sin_tensor);
-    
-    
-    // Pass through decoder layers
-    for (size_t i = 0; i < NUM_HIDDEN_LAYERS; i++) {
-        layers_[i]->forward(hidden_states, cos, sin, attention_mask, output);
-        hidden_states = output;
-    }
-    
-    // Final norm;
-    norm_->forward(hidden_states, normed_output);
+    // Workspace 포인터 (RoPE 할당 제거됨)
+    float* curr_ws = workspace_.device_data();
 
-    // -------------------------------------------------------------------------
-    // 4. LM Head Projection (GPU Optimized)
-    // -------------------------------------------------------------------------
-    // 4-1. Slice Last Token: [Batch, Seq, Hidden] -> [Batch, Hidden]
-    // logits 계산을 위해 마지막 토큰만 필요함
+    // 1. RoPE Setup (Zero-Copy)
+    // [수정] Workspace를 쓰지 않고, 내부 캐시 포인터를 가져옵니다.
+    // Host 할당 방지(false) 
+    Tensor cos({(size_t)seq_len, (size_t)HEAD_DIM}, false); 
+    Tensor sin({(size_t)seq_len, (size_t)HEAD_DIM}, false);
     
-    // Last hidden buffer 할당 (GPU)
-    
-    // Launch Slice Kernel
-    {
-        int total_threads = batch * HIDDEN_SIZE;
-        int threads = 256;
-        int blocks = (total_threads + threads - 1) / threads;
-        
-        slice_last_token_kernel<<<blocks, threads>>>(
-            normed_output.device_data(),
-            last_hidden.device_data(),
-            batch,
-            seq_len,
-            HIDDEN_SIZE
-        );
-        CHECK_CUDA(cudaGetLastError());
+    // 내부에서 cos.set_external_device_data(cache_ptr) 수행
+    rotary_emb_->forward(seq_len, cos, sin);
+
+    // 2. Shard별 입력 처리
+    if (start_layer_ == 0) {
+        // [Shard 0] Embedding
+        embedding_layer_->forward(d_input_ids, hidden_states_, batch, seq_len);
+    } 
+    else {
+        // [Shard 1] Input Wait (P2P Recv)
+        // Shard 0이 데이터를 보낼 때까지 대기 (Main 루프 제어)
     }
 
-    // 4-2. LM Head Matmul: [Batch, Hidden] @ [Hidden, Vocab] -> [Batch, Vocab]
-    // lm_head_는 이미 load_output_layers에서 Transpose 되어 [Hidden, Vocab] 상태라고 가정
-    // (Tensor::load_from_file로 읽고 transpose() 호출했으므로)
-    
+    // 3. Layer Loop (No Allocation)
+    // curr_ws는 이제 온전히 Layer들의 임시 버퍼로만 쓰입니다.
+    for (int i = start_layer_; i < end_layer_; i++) {
+        layers_[i]->forward(hidden_states_, cos, sin, nullptr, hidden_states_, curr_ws);
+    }
 
-    {
-        int M = batch;
-        int N = VOCAB_SIZE;
-        int K = HIDDEN_SIZE;
-        // M_sub는 타일링용, M과 동일하게 설정
+    // 4. Output or Send
+    if (end_layer_ < NUM_HIDDEN_LAYERS) {
+        // [Shard 0 -> Shard 1] P2P 전송
+        if (peer_input_ptr_ != nullptr) {
+            size_t transfer_size = batch * seq_len * HIDDEN_SIZE * sizeof(float);
+            
+            CHECK_CUDA(cudaMemcpyPeerAsync(
+                peer_input_ptr_, peer_device_id_, 
+                hidden_states_.device_data(), device_id_, 
+                transfer_size, stream_
+            ));
+            CHECK_CUDA(cudaStreamSynchronize(stream_));
+        }
+    } 
+    else {
+        // [Shard 1] Final Output
         
-        const int BM = 64, BN = 64, BK = 32, TM = 8, TN = 4;
-        const int BSM = BM / TM, BSN = BN / TN;
-        dim3 block(BSN, BSM);
-        dim3 grid((N + BN - 1) / BN, (M + BM - 1) / BM);
-        
-        matmul_kernel<BM, BN, BK, TM, TN><<<grid, block>>>(
-            last_hidden.device_data(),
-            lm_head_.device_data(),
-            logits.device_data(),
-            M, N, K, M
-        );
+        // Final Norm
+        norm_->forward(hidden_states_, hidden_states_);
+
+        // Slice Last Token
+        {
+            int total_threads = batch * HIDDEN_SIZE;
+            int threads = 256;
+            int blocks = (total_threads + threads - 1) / threads;
+            
+            slice_last_token_kernel<<<blocks, threads, 0, stream_>>>(
+                hidden_states_.device_data(),
+                last_hidden_.device_data(), 
+                batch, seq_len, HIDDEN_SIZE
+            );
+        }
+
+        // LM Head
+        {
+             const int BM = 64, BN = 64, BK = 32, TM = 8, TN = 4;
+             const int BSM = BM / TM, BSN = BN / TN;
+             dim3 block(BSN, BSM);
+             dim3 grid((VOCAB_SIZE + BN - 1) / BN, (batch + BM - 1) / BM);
+             
+             matmul_kernel<BM, BN, BK, TM, TN><<<grid, block, 0, stream_>>>(
+                last_hidden_.device_data(),
+                lm_head_.device_data(),
+                logits.device_data(),
+                batch, VOCAB_SIZE, HIDDEN_SIZE, batch
+             );
+        }
     }
 
 

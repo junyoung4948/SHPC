@@ -55,6 +55,42 @@ void transpose_on_host(float *dst, const float *src, int rows, int cols) {
   }
 }
 
+// ============================================================================
+// [NEW] MLP Fused Transpose Kernel
+// W1, W3를 GPU 상에서 Transpose하고 하나로 합칩니다.
+// Input: w1[Int, Hidden], w3[Int, Hidden]
+// Output: w13[Hidden, 2*Int] (Fused & Transposed)
+// ============================================================================
+__global__ void mlp_fuse_transpose_kernel(
+    const float* __restrict__ w1, 
+    const float* __restrict__ w3, 
+    float* __restrict__ w13, 
+    int intermediate_size, 
+    int hidden_size) 
+{
+    // Output Coordinates: w13[row, col]
+    // row corresponds to Hidden Dimension
+    // col corresponds to 2*Intermediate Dimension
+    int row = blockIdx.y * blockDim.y + threadIdx.y; // 0 .. Hidden
+    int col = blockIdx.x * blockDim.x + threadIdx.x; // 0 .. 2*Int
+
+    if (row < hidden_size && col < 2 * intermediate_size) {
+        float val = 0.0f;
+        
+        // Load from W1 or W3 (Transposed access)
+        // W1 shape: [Int, Hidden] -> We want W1[col, row]
+        if (col < intermediate_size) {
+            val = w1[col * hidden_size + row]; 
+        } else {
+            // W3 shape: [Int, Hidden] -> We want W3[col-Int, row]
+            val = w3[(col - intermediate_size) * hidden_size + row];
+        }
+        
+        // Store to W13 [Hidden, 2*Int]
+        w13[row * (2 * intermediate_size) + col] = val;
+    }
+}
+
 // [Generalized Matmul Kernel using Templates]
 // Tiling parameter를 호출 시점에 < > 로 전달받아 재사용성 극대화
 template <int BM, int BN, int BK, int TM, int TN>
@@ -511,35 +547,64 @@ void moe_initialize(int batch, int seq_len, int hidden_size, int num_experts,
     std::vector<float> h_w2_T(expert_hidden_size * hidden_size);
 
     for (int i = 0; i < num_experts; i++) {
+        float *d_w13;
+        float* d_w1;
+        float* d_w3;
+        CHECK_CUDA(cudaMalloc(&d_w13, hidden_size * fused_dim * sizeof(float)));
+        h_expert_w13_ptrs[i] = d_w13;
+
+        CHECK_CUDA(cudaMalloc(&d_w1, expert_hidden_size * hidden_size * sizeof(float)));
+        CHECK_CUDA(cudaMalloc(&d_w3, expert_hidden_size * hidden_size * sizeof(float)));
+
+        CHECK_CUDA(cudaMemcpy(d_w1, expert_w1[i], expert_hidden_size * hidden_size * sizeof(float), cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(d_w3, expert_w3[i], expert_hidden_size * hidden_size * sizeof(float), cudaMemcpyHostToDevice));
+
+        // 3. Launch Fused Transpose Kernel
+        {
+            dim3 block(32, 32);
+            dim3 grid((fused_dim + 31) / 32, (hidden_size + 31) / 32);
+            
+            mlp_fuse_transpose_kernel<<<grid, block>>>(
+                d_w1, 
+                d_w3, 
+                d_w13, 
+                expert_hidden_size, 
+                hidden_size
+            );
+            CHECK_CUDA(cudaGetLastError());
+            // w1, w3가 소멸되기 전에 커널 완료 보장 (생성자 스코프 내 동기화)
+            CHECK_CUDA(cudaDeviceSynchronize()); 
+        }
+        cudaFree(d_w1);
+        cudaFree(d_w3);
+
+        //
         // 1-1. Transpose W1, W3
         // Src: [expert_hidden, hidden] -> Dst: [hidden, expert_hidden]
-        transpose_on_host(h_w1_T.data(), expert_w1[i], expert_hidden_size, hidden_size);
-        transpose_on_host(h_w3_T.data(), expert_w3[i], expert_hidden_size, hidden_size);
+        // transpose_on_host(h_w1_T.data(), expert_w1[i], expert_hidden_size, hidden_size);
+        // transpose_on_host(h_w3_T.data(), expert_w3[i], expert_hidden_size, hidden_size);
 
-        // 1-2. Fuse W1, W3 into W13 (Interleave Rows)
-        // h_w1_T와 h_w3_T를 행(Row) 단위로 이어 붙입니다.
-        // 결과 행렬 크기: [hidden_size, 2 * expert_hidden_size]
-        for (int r = 0; r < hidden_size; r++) {
-            // W1 Part Copy
-            memcpy(h_w13_fused.data() + r * fused_dim, 
-                   h_w1_T.data() + r * expert_hidden_size, 
-                   expert_hidden_size * sizeof(float));
+        // // 1-2. Fuse W1, W3 into W13 (Interleave Rows)
+        // // h_w1_T와 h_w3_T를 행(Row) 단위로 이어 붙입니다.
+        // // 결과 행렬 크기: [hidden_size, 2 * expert_hidden_size]
+        // for (int r = 0; r < hidden_size; r++) {
+        //     // W1 Part Copy
+        //     memcpy(h_w13_fused.data() + r * fused_dim, 
+        //            h_w1_T.data() + r * expert_hidden_size, 
+        //            expert_hidden_size * sizeof(float));
             
-            // W3 Part Copy (바로 뒤에 붙임)
-            memcpy(h_w13_fused.data() + r * fused_dim + expert_hidden_size, 
-                   h_w3_T.data() + r * expert_hidden_size, 
-                   expert_hidden_size * sizeof(float));
-        }
+        //     // W3 Part Copy (바로 뒤에 붙임)
+        //     memcpy(h_w13_fused.data() + r * fused_dim + expert_hidden_size, 
+        //            h_w3_T.data() + r * expert_hidden_size, 
+        //            expert_hidden_size * sizeof(float));
+        // }
 
         // 1-3. Transpose W2
         // Src: [hidden, expert_hidden] -> Dst: [expert_hidden, hidden]
         transpose_on_host(h_w2_T.data(), expert_w2[i], hidden_size, expert_hidden_size);
 
         // 1-4. GPU Allocation & Copy (W13)
-        float *d_w13;
-        CHECK_CUDA(cudaMalloc(&d_w13, hidden_size * fused_dim * sizeof(float)));
-        CHECK_CUDA(cudaMemcpy(d_w13, h_w13_fused.data(), hidden_size * fused_dim * sizeof(float), cudaMemcpyHostToDevice));
-        h_expert_w13_ptrs[i] = d_w13;
+        
 
         // 1-5. GPU Allocation & Copy (W2)
         float *d_w2;
