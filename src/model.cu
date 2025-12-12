@@ -643,8 +643,7 @@ __device__ inline void warp_find_max(float& my_val, int& my_idx, float& max_val,
 }
 
 // [Step 2 Optimized]
-// Grid: (TotalTokens + 7) / 8  (블록당 8개의 토큰 처리 = 256 스레드)
-// Block: 256 threads (8 Warps)
+// 수정사항: Sorting Score(Bias 포함)와 Final Weight(Bias 제외) 분리
 __global__ void moe_topk_kernel_opt(const float* __restrict__ logits,
                                   const float* __restrict__ bias,
                                   int* __restrict__ topk_indices,
@@ -657,107 +656,95 @@ __global__ void moe_topk_kernel_opt(const float* __restrict__ logits,
   // 1. Shared Memory Histogram (Expert Count 집계용)
   __shared__ int s_expert_counts[32]; // 32 Experts
   
-  // Block 초기화: s_expert_counts 0으로 밀기
-  // BlockDim=256이지만 Expert=32이므로 앞쪽 스레드만 작업
   if (threadIdx.x < 32) {
       s_expert_counts[threadIdx.x] = 0;
   }
-  __syncthreads(); // 초기화 완료 대기
+  __syncthreads(); 
 
   // 2. Identify Token & Lane
   int warp_id = threadIdx.x / 32;
   int lane_id = threadIdx.x % 32;
-  int global_token_idx = blockIdx.x * 8 + warp_id; // 블록당 8토큰 처리
+  int global_token_idx = blockIdx.x * 8 + warp_id; 
 
-  // 유효한 토큰인지 확인 (총 토큰 수 체크 로직은 호출부 Grid 계산에 의존하거나 여기서 인자로 받아서 체크)
-  // 여기서는 일단 유효하다고 가정 (Host에서 패딩하거나 정확히 계산)
-  
-  // 2. Load & Sigmoid (Warp 내 병렬 처리)
-  float my_val = -1e20f; // Padding for out of bound experts
+  // 3. Load & Sigmoid
+  // my_score: Top-K 선정 경쟁용 (Bias 포함)
+  // my_prob:  최종 저장용 (Bias 제외, Pure Sigmoid)
+  float my_score = -1e20f; 
+  float my_prob = 0.0f;     
   int my_idx = lane_id;
 
-  // if (lane_id < num_experts) {
-  // Logits array: [NumTokens, NumExperts]
-  // But wait, Grid covers TotalTokens. 
-  // Need to check if global_token_idx is within bounds if batch is arbitrary.
-  // Assuming valid access for now.
-  
-  float val = logits[global_token_idx * num_experts + lane_id];
-  my_val = 1.0f / (1.0f + expf(-val)) + bias[lane_id];
-  // if (use_bias) my_val += bias[lane_id];
-  // }
+  // 유효한 Expert 범위 내에서만 로드
+  if (lane_id < num_experts) { 
+      float val = logits[global_token_idx * num_experts + lane_id];
+      float sigmoid_val = 1.0f / (1.0f + expf(-val));
+      
+      my_prob = sigmoid_val; // Bias 없는 값 보관
+      
+      // 경쟁용 점수에는 Bias 추가
+      if (use_bias) {
+          my_score = sigmoid_val + bias[lane_id];
+      } else {
+          my_score = sigmoid_val;
+      }
+  }
 
-  // 3. Warp-level Top-K Selection (Loop K times)
-  // 스레드 하나가 루프 도는 게 아니라, Shuffle로 병렬로 Max 찾기
-  
-  // 선택된 값들을 저장할 레지스터 배열
-  int my_choice_idx = -1;
-  float my_choice_val = 0.0f;
-  
-  // K번 반복하며 Max 찾기
+  // 4. Warp-level Top-K Selection
+  float my_saved_weight = 0.0f;
+  int my_saved_idx = -1;
+  float sum_weights = 0.0f;
+
   for (int k = 0; k < k_top; ++k) {
       float iter_max_val;
       int iter_max_idx;
       
-      // Warp Reduce로 Max 찾기 (모든 레인이 같은 결과를 가짐)
-      warp_find_max(my_val, my_idx, iter_max_val, iter_max_idx);
+      // Sorting은 my_score(Bias 포함) 기준으로 수행
+      warp_find_max(my_score, my_idx, iter_max_val, iter_max_idx);
       
-      // 결과를 Top-K 버퍼에 저장 (Lane 0 ~ 3이 나눠서 저장하는 게 아니라,
-      // 지금은 모든 레인이 누가 1등인지 알고 있음)
-      
-      // Lane K가 자신의 자리에 기록 (Lane 0은 1등, Lane 1은 2등...)
-      // 이렇게 하려면 이번 루프의 Max가 "나(Lane ID)"여야 함.
-      // 하지만 warp_find_max는 값을 Broadcast함.
-      
-      // Lane k (0,1,2,3) 가 결과를 Global Memory에 씀
+      // [핵심 수정] 
+      // 승자(iter_max_idx)가 결정되었으므로, 승자의 'my_prob(Bias 제외)'를 가져옵니다.
+      // iter_max_val(Bias 포함)을 쓰지 않고, 원본 Sigmoid 값을 가져옴
+      float winner_prob = __shfl_sync(0xffffffff, my_prob, iter_max_idx);
+
+      // Lane k가 저장 담당
       if (lane_id == k) {
-          topk_indices[global_token_idx * k_top + k] = iter_max_idx;
-          topk_weights[global_token_idx * k_top + k] = iter_max_val; // 정규화 전
-          
-          // [중요] Shared Memory Atomic Add
-          // Global이 아니라 Shared에 더하므로 매우 빠름
+          my_saved_weight = winner_prob; // Bias 없는 값 저장
+          my_saved_idx = iter_max_idx;
           atomicAdd(&s_expert_counts[iter_max_idx], 1);
       }
       
-      // 선택된 Max 값을 가진 스레드(Owner)는 자신의 my_val을 -inf로 변경하여 다음 루프에서 제외
+      // Sum 누적 (Bias 없는 값으로 누적해야 함)
+      if (lane_id == 0) {
+          sum_weights += winner_prob;
+      }
+
+      // 선택된 Expert는 다음 루프에서 제외 (점수를 매우 낮춤)
       if (my_idx == iter_max_idx) {
-          my_val = -1e20f;
-      }
-      
-      // 필요하다면 마스킹 정보를 동기화해야 할 수도 있으나,
-      // my_val이 변경되었고 다음 warp_find_max에서 반영되므로 OK.
-  }
-  
-  // 4. Normalize Weights
-  // Lane 0~3이 자신의 weight를 가지고 있음.
-  // 하지만 Global Memory에 이미 썼음. 다시 읽어서 정규화?
-  // 아니면 Sum을 구해서 나누기.
-  
-  // Sum 계산 (Lane 0~3만 유효한 값을 가짐 -> 하지만 이미 Global에 씀)
-  // 간단하게: Lane 0이 Global에서 4개를 읽어 합을 구하고 다시 씀.
-  // 혹은 위 루프에서 Register에 모아둘 수도 있음.
-  
-  // 최적화: 위 루프에서 Lane 0~3은 이미 답을 알고 있지 않음 (Broadcast됨).
-  // 위 루프 수정: iter_max_val은 모든 레인이 앎.
-  // Lane 0이 sum을 누적할 수 있음.
-  
-  // (다시 코딩하면 복잡해지니, 가장 깔끔한 방법: Lane 0이 후처리)
-  if (lane_id == 0) {
-      float sum = 0.0f;
-      int offset = global_token_idx * k_top;
-      for(int i=0; i<k_top; ++i) sum += topk_weights[offset + i];
-      
-      if (sum > 1e-6f) {
-          float scale = 1.0f / sum;
-          for(int i=0; i<k_top; ++i) topk_weights[offset + i] *= scale;
+          my_score = -1e20f;
       }
   }
 
-  __syncthreads(); // Block 내 모든 Warp가 작업을 마칠 때까지 대기
+  // 5. Normalization & Write
+  float total_sum = __shfl_sync(0xffffffff, sum_weights, 0);
 
-  // 5. Shared Histogram -> Global Histogram Flush
-  // Block 내의 집계 결과를 Global Memory로 이동
-  // 앞쪽 32개 스레드만 작업 (각자 하나의 Expert 담당)
+  if (lane_id < k_top) {
+      if (total_sum > 1e-6f) {
+          my_saved_weight /= total_sum;
+      } else {
+          my_saved_weight = 1.0f / k_top; 
+      }
+
+      // 라우팅 스케일링 팩터 적용 (필요하다면)
+      // model.cu에 ROUTED_SCALING_FACTOR가 있다면 여기서 곱해줘야 함
+      // 현재 코드 문맥상 없으면 생략. 보통 1.0이거나 별도 상수.
+      
+      int offset = global_token_idx * k_top + lane_id;
+      topk_indices[offset] = my_saved_idx;
+      topk_weights[offset] = my_saved_weight;
+  }
+
+  __syncthreads();
+
+  // 6. Histogram Flush
   if (threadIdx.x < 32) {
       int count = s_expert_counts[threadIdx.x];
       if (count > 0) {
@@ -765,6 +752,7 @@ __global__ void moe_topk_kernel_opt(const float* __restrict__ logits,
       }
   }
 }
+
 
 // [Step 4] Permutation Kernel
 // 역할: source_row_indices 지도를 보고 원본 x에서 데이터를 가져와 permuted_x에 복사
@@ -829,7 +817,9 @@ __global__ void silu_and_mul_fused_kernel(const float* __restrict__ input,
         float val_w1 = input[w1_idx];
         float val_w3 = input[w3_idx];
         
-        float silu = val_w1 / (1.0f + expf(-val_w1));
+        float temp = 1.0f / (1.0f + expf(-val_w1));
+        
+        float silu = val_w1 * temp;
         
         // 안전하게 다른 버퍼(output)에 씀
         output[idx] = silu * val_w3;
